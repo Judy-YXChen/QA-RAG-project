@@ -1,0 +1,16 @@
+# 虛擬環境
+venv/
+
+# Python 暫存
+__pycache__/
+*.pyc
+
+# VS Code 設定
+.vscode/
+
+# Streamlit & Jupyter 快取
+.streamlit/
+.ipynb_checkpoints/
+
+# 系統檔案
+.DS_Store
