@@ -3,6 +3,10 @@ from typing import List, Dict, Any, Optional, cast
 from enum import Enum
 import requests
 import joblib
+import os
+from dotenv import load_dotenv
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # ============================ Page Config ============================
 st.set_page_config(page_title="RAG QA Chatbot", page_icon="🧠", layout="centered")
@@ -21,17 +25,17 @@ class VectorModel(str, Enum):
     BGE = "BGE‑base‑zh"            # 中文語料最佳，適合新聞語句
     BERT = "bert‑base‑chinese"     # 經典中文 BERT
 
-# 對應路徑 & 模型名稱（請依實際檔案調整）
+# 對應路徑 & 模型名稱
 MODEL_CONFIG: Dict[VectorModel, Dict[str, str]] = {
     VectorModel.BGE: {
         "embedding_name": "BAAI/bge-base-zh",
-        "faiss_path": "faiss_index_bge",
-        "cluster_path": "kmeans_bge.pkl",
+        "faiss_path": "indexes/faiss_index_bge",
+        "cluster_path": "indexes/kmeans_bge.pkl",
     },
     VectorModel.BERT: {
         "embedding_name": "bert-base-chinese",
-        "faiss_path": "faiss_index_bert",
-        "cluster_path": "kmeans_bert.pkl",
+        "faiss_path": "indexes/faiss_index_bert",
+        "cluster_path": "indexes/kmeans_bert.pkl",
     },
 }
 
@@ -47,7 +51,7 @@ with st.sidebar:
         "Vector Model", list(VectorModel), format_func=lambda m: m.value)
     mode: RetrievalMode = st.selectbox(
         "Retrieval Mode", list(RetrievalMode), format_func=lambda m: m.value)
-    top_k = st.slider("Top‑K Documents", 1, 20, 5)
+    top_k = st.slider("Top‑K Documents", 1, 20, 1)
     temperature = st.slider("LLM Temperature", 0.0, 1.0, 0.7)
     st.markdown("---")
     st.caption("Mode 1 = 全庫 | Mode 2 = 依分群 | Mode 3 = 交由 LangGraph（簡/詳答）")
@@ -55,22 +59,26 @@ with st.sidebar:
 # -------------------------------------------------------------------
 # 2. RESOURCE LOADERS (CACHED) ---------------------------------------
 # -------------------------------------------------------------------
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.vectorstores import FAISS
-from langchain.llms import OpenAI
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_openai import ChatOpenAI
 from langchain.chains import RetrievalQA
+import pathlib
+
+ROOT = pathlib.Path(__file__).resolve().parent
 
 @st.cache_resource(show_spinner=False)
 def load_resources_per_model(cfg: Dict[str, str]) -> Dict[str, Any]:
     """Load embeddings, FAISS index, cluster model, base LLM for one vector model."""
     embeddings = HuggingFaceEmbeddings(model_name=cfg["embedding_name"])
-    vector_store = FAISS.load_local(cfg["faiss_path"], embeddings)
+    faiss_dir = ROOT / cfg["faiss_path"] # 絕對路徑，避免因工作目錄不同而找不到
+    vector_store = FAISS.load_local(str(faiss_dir), embeddings, allow_dangerous_deserialization=True)
     # clusterer is optional
     try:
         clusterer = joblib.load(cfg["cluster_path"])
     except FileNotFoundError:
         clusterer = None
-    base_llm = OpenAI(model_name="gpt-4o-mini", temperature=0.0)
+    base_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0)
     return {
         "embeddings": embeddings,
         "vector_store": vector_store,
@@ -113,13 +121,12 @@ def _build_retriever(model: VectorModel, k: int, cluster_id: Optional[int] = Non
 def get_rag_answer(query: str, model: VectorModel, mode: RetrievalMode, k: int, temp: float):
     """Route query through the selected pipeline & vector space."""
 
-    base_llm = _RESOURCES[model]["base_llm"]
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=temp)
 
     # Mode 1 ── 全庫檢索
     if mode == RetrievalMode.ALL:
         retriever = _build_retriever(model, k)
-        chain = RetrievalQA.from_chain_type(base_llm, retriever=retriever, chain_type="stuff")
-        chain.combine_documents_chain.llm.temperature = temp
+        chain = RetrievalQA.from_chain_type(llm, retriever=retriever, chain_type="stuff")
         result: Dict[str, Any] = chain({"query": query})
         return result["result"], result.get("source_documents", [])
 
@@ -129,7 +136,7 @@ def get_rag_answer(query: str, model: VectorModel, mode: RetrievalMode, k: int, 
         if cid is None:
             return "🚧 Cluster model not loaded; using full‑corpus retrieval.", []
         retriever = _build_retriever(model, k, cluster_id=cid)
-        chain = RetrievalQA.from_chain_type(base_llm, retriever=retriever, chain_type="stuff")
+        chain = RetrievalQA.from_chain_type(llm, retriever=retriever, chain_type="stuff")
         chain.combine_documents_chain.llm.temperature = temp
         result: Dict[str, Any] = chain({"query": query})
         answer = f"(Model {model.value} | Cluster {cid})\n" + result["result"]
