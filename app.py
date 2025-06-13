@@ -1,12 +1,13 @@
+import os
+os.environ["STREAMLIT_SERVER_FILE_WATCHER_TYPE"] = "none" # 關閉 Streamlit 的「檔案監聽 ‧ 熱重載」機制，避免 Streamlit 監聽 torch.classes 目錄時觸發的已知 bug
 import streamlit as st
 from typing import List, Dict, Any, Optional, cast
 from enum import Enum
 import requests
 import joblib
-import os
+from pydantic import SecretStr
 from dotenv import load_dotenv
-load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+load_dotenv() # 自 .env 載入 GOOGLE_API_KEY，供 ChatGoogleGenerativeAI 使用
 
 # ============================ Page Config ============================
 st.set_page_config(page_title="RAG QA Chatbot", page_icon="🧠", layout="centered")
@@ -62,7 +63,9 @@ with st.sidebar:
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_openai import ChatOpenAI
-from langchain.chains import RetrievalQA
+from langchain.chains import create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate
 import pathlib
 
 ROOT = pathlib.Path(__file__).resolve().parent
@@ -78,7 +81,15 @@ def load_resources_per_model(cfg: Dict[str, str]) -> Dict[str, Any]:
         clusterer = joblib.load(cfg["cluster_path"])
     except FileNotFoundError:
         clusterer = None
-    base_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0)
+
+    gemini_api_key = SecretStr(os.getenv("GOOGLE_API_KEY") or "")
+    gemini_api_base = "https://generativelanguage.googleapis.com/v1beta/openai/"
+    base_llm = ChatOpenAI(
+        api_key=gemini_api_key,
+        base_url=gemini_api_base,
+        model="gemini-1.5-flash",
+        temperature=0.0
+    )
     return {
         "embeddings": embeddings,
         "vector_store": vector_store,
@@ -121,14 +132,27 @@ def _build_retriever(model: VectorModel, k: int, cluster_id: Optional[int] = Non
 def get_rag_answer(query: str, model: VectorModel, mode: RetrievalMode, k: int, temp: float):
     """Route query through the selected pipeline & vector space."""
 
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=temp)
+    gemini_api_key = SecretStr(os.getenv("GOOGLE_API_KEY") or "")
+    gemini_api_base = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
+    llm = ChatOpenAI(
+        api_key=gemini_api_key,
+        base_url=gemini_api_base,
+        model="gemini-1.5-flash",
+        temperature=temp
+    )
 
     # Mode 1 ── 全庫檢索
     if mode == RetrievalMode.ALL:
         retriever = _build_retriever(model, k)
-        chain = RetrievalQA.from_chain_type(llm, retriever=retriever, chain_type="stuff")
-        result: Dict[str, Any] = chain({"query": query})
-        return result["result"], result.get("source_documents", [])
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "Use the following context to answer the question: \n\n{context}. If you don’t know, say so."),
+            ("human", "{input}")
+        ])
+        combine_chain = create_stuff_documents_chain(llm=llm, prompt=prompt)
+        chain = create_retrieval_chain(retriever=retriever, combine_docs_chain=combine_chain)
+        result: Dict[str, Any] = chain.invoke({"input": query})
+        return result["answer"], result.get("source_documents", [])
 
     # Mode 2 ── 群內檢索
     if mode == RetrievalMode.CLUSTER:
@@ -136,10 +160,15 @@ def get_rag_answer(query: str, model: VectorModel, mode: RetrievalMode, k: int, 
         if cid is None:
             return "🚧 Cluster model not loaded; using full‑corpus retrieval.", []
         retriever = _build_retriever(model, k, cluster_id=cid)
-        chain = RetrievalQA.from_chain_type(llm, retriever=retriever, chain_type="stuff")
-        chain.combine_documents_chain.llm.temperature = temp
-        result: Dict[str, Any] = chain({"query": query})
-        answer = f"(Model {model.value} | Cluster {cid})\n" + result["result"]
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "Use the following context to answer the question: \n\n{context}. If you don’t know, say so."),
+            ("human", "{input}")
+        ])
+        combine_chain = create_stuff_documents_chain(llm=llm, prompt=prompt)
+        chain = create_retrieval_chain(retriever=retriever, combine_docs_chain=combine_chain)
+        result: Dict[str, Any] = chain.invoke({"input": query})
+
+        answer = f"(Model {model.value} | Cluster {cid})\n" + result["answer"]
         return answer, result.get("source_documents", [])
 
     # Mode 3 ── LangGraph（多步模板）
@@ -200,6 +229,6 @@ if user_query:
 # 6. FOOTER -----------------------------------------------------------
 # -------------------------------------------------------------------
 st.markdown(
-    """<hr style='margin-top:2rem;margin-bottom:1rem;'>\n    <center><small>Built with 🦜 LangChain + LangGraph (mode 3) + 🧠 Streamlit </small></center>""",
+    """<hr style='margin-top:2rem;margin-bottom:1rem;'>\n    <center><small>Built with 🦜 LangChain + 🧠 Streamlit </small></center>""",
     unsafe_allow_html=True,
 )
