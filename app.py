@@ -55,7 +55,7 @@ with st.sidebar:
     top_k = st.slider("Top‑K Documents", 1, 20, 1)
     temperature = st.slider("LLM Temperature", 0.0, 1.0, 0.7)
     st.markdown("---")
-    st.caption("Mode 1 = 全庫 | Mode 2 = 依分群 | Mode 3 = 交由 LangGraph（簡/詳答）")
+    st.caption("Mode 1 = 全庫 | Mode 2 = 依分群 | Mode 3 = 依分群 + QA")
 
 # -------------------------------------------------------------------
 # 2. RESOURCE LOADERS (CACHED) ---------------------------------------
@@ -67,6 +67,7 @@ from langchain.chains import create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate
 import pathlib
+import numpy as np
 
 ROOT = pathlib.Path(__file__).resolve().parent
 
@@ -76,10 +77,18 @@ def load_resources_per_model(cfg: Dict[str, str]) -> Dict[str, Any]:
     embeddings = HuggingFaceEmbeddings(model_name=cfg["embedding_name"])
     faiss_dir = ROOT / cfg["faiss_path"] # 絕對路徑，避免因工作目錄不同而找不到
     vector_store = FAISS.load_local(str(faiss_dir), embeddings, allow_dangerous_deserialization=True)
-    # clusterer is optional
+    # clusterer is optional ## debug
+    # === Load cluster model ===
+    clusterer = None
+    clusterer_path = os.path.join(ROOT, cfg["cluster_path"])
+    print("[DEBUG] cluster_path =", clusterer_path)
+    print("[DEBUG] Exists?", os.path.exists(clusterer_path))
+
     try:
-        clusterer = joblib.load(cfg["cluster_path"])
-    except FileNotFoundError:
+        clusterer = joblib.load(clusterer_path)
+        print("[INFO] Cluster model loaded successfully.")
+    except Exception as e:
+        print(f"[ERROR] Failed to load clusterer from {clusterer_path}: {e}")
         clusterer = None
 
     gemini_api_key = SecretStr(os.getenv("GOOGLE_API_KEY") or "")
@@ -109,29 +118,36 @@ _RESOURCES = load_all_resources()
 # -------------------------------------------------------------------
 
 def _predict_cluster(query: str, model: VectorModel) -> Optional[int]:
-    """Predict cluster_id for the query using the chosen model."""
+    """Predict cluster ID using vector model's clusterer."""
     clusterer = _RESOURCES[model]["clusterer"]
     if clusterer is None:
-        return None
-    try:
-        vec = _RESOURCES[model]["embeddings"].embed_query(query)
-        return int(clusterer.predict([vec])[0])
-    except Exception:
+        print("[WARN] Cluster model not loaded.")
         return None
 
+    try:
+        vec_raw = _RESOURCES[model]["embeddings"].embed_query(query)
+        vec = np.asarray(vec_raw, dtype=np.float32).reshape(1, -1)
+        cid = clusterer.predict(vec)[0]
+        print(f"[DEBUG] Predicted cluster ID: {cid}")
+        return int(cid)
+    except Exception as e:
+        print(f"[ERROR] Failed to predict cluster: {e}")
+        return None
 
 def _build_retriever(model: VectorModel, k: int, cluster_id: Optional[int] = None):
     """Return retriever bound to chosen vector space, optionally filtered by cluster."""
     vs = _RESOURCES[model]["vector_store"]
     kwargs: Dict[str, Any] = {"k": k}
+
     if cluster_id is not None:
         kwargs["filter"] = {"cluster_id": cluster_id}
-    return vs.as_retriever(search_kwargs=kwargs)
-
+        print(f"[DEBUG] Applying cluster filter: cluster_id = {cluster_id}")
+    
+    retriever = vs.as_retriever(search_kwargs=kwargs)
+    return retriever
 
 def get_rag_answer(query: str, model: VectorModel, mode: RetrievalMode, k: int, temp: float):
     """Route query through the selected pipeline & vector space."""
-
     gemini_api_key = SecretStr(os.getenv("GOOGLE_API_KEY") or "")
     gemini_api_base = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
@@ -146,32 +162,38 @@ def get_rag_answer(query: str, model: VectorModel, mode: RetrievalMode, k: int, 
     if mode == RetrievalMode.ALL:
         retriever = _build_retriever(model, k)
         prompt = ChatPromptTemplate.from_messages([
-            ("system", "Use the following context to answer the question: \n\n{context}. If you don’t know, say so."),
+            ("system", "Use the following context to answer the question. If you don’t know, say so.\n\n{context}"),
             ("human", "{input}")
         ])
         combine_chain = create_stuff_documents_chain(llm=llm, prompt=prompt)
         chain = create_retrieval_chain(retriever=retriever, combine_docs_chain=combine_chain)
-        result: Dict[str, Any] = chain.invoke({"input": query})
+        result = chain.invoke({"input": query})
         return result["answer"], result.get("source_documents", [])
 
     # Mode 2 ── 群內檢索
     if mode == RetrievalMode.CLUSTER:
         cid = _predict_cluster(query, model)
         if cid is None:
-            return "🚧 Cluster model not loaded; using full‑corpus retrieval.", []
+            return "⚠️ 無法辨識此問題屬於哪個主題群，將跳過回答。", []
         retriever = _build_retriever(model, k, cluster_id=cid)
+        docs = retriever.invoke(query)
+        if not docs:
+            return f"⚠️ 雖然預測為第 {cid} 群，但查無相關資料。", []
+        print(f"[DEBUG] Retrieved {len(docs)} docs from cluster {cid}")
         prompt = ChatPromptTemplate.from_messages([
-            ("system", "Use the following context to answer the question: \n\n{context}. If you don’t know, say so."),
+            ("system", "Use the following context to answer the question. If you don’t know, say so.\n\n{context}"),
             ("human", "{input}")
         ])
         combine_chain = create_stuff_documents_chain(llm=llm, prompt=prompt)
         chain = create_retrieval_chain(retriever=retriever, combine_docs_chain=combine_chain)
-        result: Dict[str, Any] = chain.invoke({"input": query})
+        try:
+            result = chain.invoke({"input": query})
+            answer = f"(Model {model.value} | Cluster {cid})\n" + result["answer"]
+            return answer, result.get("source_documents", [])
+        except Exception as e:
+            return f"❌ 分群問答流程失敗：{e}", []
 
-        answer = f"(Model {model.value} | Cluster {cid})\n" + result["answer"]
-        return answer, result.get("source_documents", [])
-
-    # Mode 3 ── LangGraph（多步模板）
+    # Mode 3 ── LangGraph 模板（外部 API 呼叫）
     cid = _predict_cluster(query, model)
     payload = {
         "query": query,
@@ -185,9 +207,9 @@ def get_rag_answer(query: str, model: VectorModel, mode: RetrievalMode, k: int, 
         rsp = requests.post(LG_ENDPOINT, json=payload, timeout=90)
         rsp.raise_for_status()
         data = rsp.json()
-        return data.get("answer", "[No answer]"), data.get("sources", [])
+        return data.get("answer", "⚠️ 尚未產生回答。"), data.get("sources", [])
     except Exception as e:
-        return f"❌ LangGraph call failed: {e}", []
+        return f"❌ LangGraph 呼叫失敗：{e}", []
 
 # -------------------------------------------------------------------
 # 4. SESSION STATE (CHAT) --------------------------------------------
