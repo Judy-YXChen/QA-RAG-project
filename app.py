@@ -8,6 +8,7 @@ import joblib
 from pydantic import SecretStr
 from dotenv import load_dotenv
 load_dotenv() # 自 .env 載入 GOOGLE_API_KEY，供 ChatGoogleGenerativeAI 使用
+from mode3 import query_type_check, get_top_simulated_questions, select_relevant_qa, generate_final_answer
 
 # ============================ Page Config ============================
 st.set_page_config(page_title="RAG QA Chatbot", page_icon="🧠", layout="centered")
@@ -193,23 +194,45 @@ def get_rag_answer(query: str, model: VectorModel, mode: RetrievalMode, k: int, 
         except Exception as e:
             return f"❌ 分群問答流程失敗：{e}", []
 
-    # Mode 3 ── LangGraph 模板（外部 API 呼叫）
-    cid = _predict_cluster(query, model)
-    payload = {
-        "query": query,
-        "cluster_id": cid,
-        "vector_model": model.value,
-        "top_k": k,
-        "temperature": temp,
-        "answer_style": "auto",
-    }
-    try:
-        rsp = requests.post(LG_ENDPOINT, json=payload, timeout=90)
-        rsp.raise_for_status()
-        data = rsp.json()
-        return data.get("answer", "⚠️ 尚未產生回答。"), data.get("sources", [])
-    except Exception as e:
-        return f"❌ LangGraph 呼叫失敗：{e}", []
+    # Mode 3 ── Cluster & Question Set
+    if mode == RetrievalMode.TEMPLATE:
+        try:
+            # 1. 預測 cluster
+            cid = _predict_cluster(query, model)
+            if cid is None:
+                return "⚠️ 無法辨識此問題屬於哪個主題群，將跳過回答。", []
+
+            # 2. 判斷簡問/詳問
+            question_type = query_type_check(query)
+
+            # 3. 向量化 user query
+            vec = _RESOURCES[model]["embeddings"].embed_query(query)
+
+            # 4. 找出同群 Top-20 相似 simulated QA
+            top_qa_df = get_top_simulated_questions(query, vec, cid, question_type, top_n=20)
+
+            # 5. Gemini relevance check（最多執行三輪，保留十筆）
+            question_col = "Q_simple" if question_type == "Q_simple" else "Q_complex"
+            relevant_qa = select_relevant_qa(llm, query, top_qa_df, question_col)
+
+            if not relevant_qa:
+                return f"⚠️ 第 {cid} 群的相關 QA 中找不到足夠內容產生回答。", []
+
+            # 6. 根據保留 QA 內容產生答案
+            answer = generate_final_answer(llm, query, relevant_qa)
+
+            # 7. 回傳答案與來源（從 QA 中取出 title + source）
+            sources = [
+                {
+                    "title": q["title"],
+                    "source": q.get("source", ""),
+                }
+                for q in relevant_qa
+            ]
+            return f"(Model {model.value} | Cluster {cid})\n" + answer, sources
+
+        except Exception as e:
+            return f"❌ 模擬問答流程失敗：{e}", []
 
 # -------------------------------------------------------------------
 # 4. SESSION STATE (CHAT) --------------------------------------------
@@ -240,9 +263,14 @@ if user_query:
             if docs:
                 with st.expander("🔗 Sources"):
                     for i, d in enumerate(docs, 1):
-                        title = d.metadata.get("title", f"Doc {i}")
-                        source = d.metadata.get("source", "")
+                        if isinstance(d, dict):  # Mode 3: QA來源
+                            title = d.get("title", f"Doc {i}")
+                            source = d.get("source", "")
+                        else:  # Mode 1 & 2: LangChain Document
+                            title = d.metadata.get("title", f"Doc {i}")
+                            source = d.metadata.get("source", "")
                         st.markdown(f"{i}. **{title}** — {source}")
+
 
     # -- 5.3 Save assistant turn
     st.session_state["messages"].append({"role": "assistant", "content": answer})
