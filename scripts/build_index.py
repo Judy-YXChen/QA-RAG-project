@@ -51,18 +51,19 @@ def build(model_key: str):
         )
 
     # 3-3 構建 Document list（欄位名稱可自行調整）
-    docs = [
-        Document(
+    docs = []
+    for idx, row in enumerate(meta_df.iterrows()):
+        row = row[1]  # 取出實際的 row 資料（Series）
+        doc = Document(
             page_content=str(row.get("processed_content(ckip)", row.get("content", ""))),
             metadata={
                 "title": row.get("title", ""),
                 "cluster_id": int(row["cluster"]),
-                "source": row.get("source", ""),  # 使用原始連結網址
-                "doc_id": idx + 1,  # 從 1 開始
+                "source": row.get("source", ""),
+                "doc_id": idx + 1,  # 避免型別推論錯誤
             },
         )
-        for idx, row in meta_df.iterrows()
-    ]
+        docs.append(doc)
 
     # 3-4 建 FAISS VectorStore
     embedder = HuggingFaceEmbeddings(model_name=cfg["embed_name"])
@@ -85,5 +86,4 @@ def build(model_key: str):
 # 4. CLI 入口
 # -------------------------------------------------------
 if __name__ == "__main__":
-    for key in DATA:
-        build(key)
+    build("bge")
