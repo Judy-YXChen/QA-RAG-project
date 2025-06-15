@@ -57,7 +57,8 @@ def build(model_key: str):
             metadata={
                 "title": row.get("title", ""),
                 "cluster_id": int(row["cluster"]),
-                "source": f"{model_key}_{idx}",
+                "source": row.get("source", ""),  # 使用原始連結網址
+                "doc_id": idx + 1,  # 從 1 開始
             },
         )
         for idx, row in meta_df.iterrows()
