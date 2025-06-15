@@ -2,9 +2,12 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics.pairwise import cosine_similarity
 from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain.chains import LLMChain
 from ckip_transformers.nlp import CkipWordSegmenter
 from pandas import DataFrame
 from stopwordsiso import stopwords
+from time import sleep
 
 # 初始化 CKIP 斷詞器（只要初始化一次，不要每次函數呼叫都跑）
 ws_driver = CkipWordSegmenter(device=-1)  # -1 表示使用 CPU
@@ -63,7 +66,7 @@ def get_top_simulated_questions(
 
     # 優先排含 query 關鍵詞的 QA，再依語意相似度排序
     merged_df["priority"] = merged_df[question_type].apply(
-        lambda q: any(term in q for term in extract_keywords_ckip(query))
+        lambda q: any(term in q for term in query_terms)
     )
 
     merged_df = merged_df.sort_values(by=["priority", "similarity"], ascending=[False, False])
@@ -75,76 +78,141 @@ def get_top_simulated_questions(
 
 
 
-def judge_relevance(llm: ChatOpenAI, query: str, qa_question: str) -> bool:
-    """使用 Gemini 判斷該 QA 是否與 user query 相關。"""
+def judge_relevance_batch(llm: ChatOpenAI, query: str, qa_list: list[str]) -> list[bool]:
+    """一次判斷多個 QA 是否與 query 有關，回傳 boolean list"""
+    qa_block = "\n".join(
+        [f"{i+1}. {q}" for i, q in enumerate(qa_list)]
+    )
     prompt = (
         f"使用者的問題是：{query}\n"
-        f"以下是一個可能的模擬問題：{qa_question}\n"
-        f"請判斷這個模擬問題是否有助於回答使用者的問題，僅回覆 是 或 否。"
+        f"以下是可能的模擬問題列表，請你判斷每一題是否與使用者的問題有關，僅回覆 '是' 或 '否'，以換行分隔：\n{qa_block}"
     )
     try:
-        result = llm.invoke(prompt)
-        return "是" in result.content
-    except Exception:
-        return False
+        response = llm.invoke(prompt)
 
-def select_relevant_qa(llm: ChatOpenAI, query: str, top_20_df: pd.DataFrame, question_col: str, max_rounds=3):
-    """從前20筆 QA 中進行 relevance check，最多保留10筆相關項目（含 debug 訊息）。"""
+        # 取得文字內容
+        text = getattr(response, "content", response)
+
+        # 若仍是 BaseMessage（非 str），再取 content
+        if not isinstance(text, str):
+            text = getattr(text, "content", "")
+
+        # 若為 list，處理成單一 string
+        if isinstance(text, list):
+            text = text[0] if isinstance(text[0], str) else text[0].get("text", "")
+
+        text = text.strip()
+        flags = text.splitlines()
+        return [("是" in f.strip()) for f in flags]
+
+    except Exception as e:
+        print(f"[ERROR] relevance batch check failed: {e}")
+        return [False] * len(qa_list)
+
+
+def select_relevant_qa(llm, query, qa_df: pd.DataFrame, question_col: str, max_rounds: int = 3) -> list[dict]:
+    """使用 Gemini 檢查問題是否與 query 相關，最多進行三輪檢查，最後不足再用 cosine similarity 補滿。"""
+    if len(qa_df) == 0:
+        print("[DEBUG] QA 資料為空，無法進行相關性判斷")
+        return []
+
+    # 準備 QA pool
+    qa_df = qa_df[[question_col, "title", "source", "similarity"]].dropna(subset=[question_col]).drop_duplicates()
+    qa_list = qa_df.to_dict(orient="records")
+
+    # prompt chain
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "你是一位多領域的問答系統助手，請判斷下列問題是否與使用者問題主題相符。如果你覺得它有助於回答用戶的問題，請回答「是」，否則回答「否」。\n\n用戶問題：{query}\n\n問題：{question}"),
+        ("human", "{question}")
+    ])
+    relevance_chain = LLMChain(llm=llm, prompt=prompt)
+
     selected = []
-    reserve = top_20_df.iloc[10:].to_dict("records")
-    candidates = top_20_df.iloc[:10].to_dict("records")
+    batch_size = 10
+    total = len(qa_list)
+    qa_list = qa_list[:max_rounds * batch_size]  # 限制最多檢查數量
 
     print(f"[DEBUG] 開始 relevance 檢查（question type: {question_col}）")
-    print(f"[DEBUG] Top 20 QA preview:")
-    for i, q in enumerate(top_20_df[question_col].tolist(), 1):
-        print(f"{i:02d}. {q}")
 
-    rounds = 0
-    while rounds < max_rounds:
-        print(f"\n[DEBUG] === Relevance Check Round {rounds+1} ===")
-        still_needed = 10 - len(selected)
-        if still_needed <= 0:
+    for i in range(max_rounds):
+        start = i * batch_size
+        end = start + batch_size
+        batch = qa_list[start:end]
+        print(f"[DEBUG] === Relevance Check Round {i+1} ===")
+        print(f"[DEBUG] Round {i+1} QA 數量: {len(batch)}")
+
+        if not batch:
             break
 
-        new_selected = []
-        for item in candidates:
-            qtext = item[question_col]
-            prompt = (
-                f"使用者的問題是：{query}\n"
-                f"以下是一個模擬問題：{qtext}\n"
-                f"請只回覆 是 或 否，這個模擬問題是否有助於回答使用者的問題？"
-            )
+        for q in batch:
+            question = q[question_col]
+            print(f"[Q] {question}")
             try:
-                result = llm.invoke(prompt)
-                reply = str(getattr(result, "content", result)).strip()
-                print(f"[Q] {qtext}\n[A] {reply}\n")
-                if reply.startswith("是"):
-                    new_selected.append(item)
+                ans = relevance_chain.invoke({"query": query, "question": question})["text"]
+                print(f"[A] {ans}")
+                if "是" in ans:
+                    selected.append(q)
             except Exception as e:
                 print(f"[ERROR] relevance check fail: {e}")
 
-        selected.extend(new_selected)
+        # 避免超過 API 限制
+        if i < max_rounds - 1:
+            print("[DEBUG] 等待 10 秒以避免 Gemini API 達到速率上限...")
+            sleep(10)
 
-        # 從 reserve 補足
-        candidates = []
-        while reserve and len(selected) + len(candidates) < 10:
-            candidates.append(reserve.pop(0))
+        if len(selected) >= 10:
+            print(f"[DEBUG] 已累積 {len(selected)} 筆相關 QA，提前結束")
+            break
 
-        rounds += 1
+    # === 補足不滿 10 筆的部分 ===
+    if len(selected) < 10:
+        print("[DEBUG] 補齊相關 QA 至 10 筆...")
+        remaining = [q for q in qa_list if q not in selected]
+        remaining_sorted = sorted(remaining, key=lambda q: q.get("similarity", 0), reverse=True)
+        to_add = remaining_sorted[:10 - len(selected)]
+        print(f"[DEBUG] 補充 {len(to_add)} 筆 QA：")
+        for q in to_add:
+            print("-", q[question_col], f"(similarity: {q.get('similarity', 0):.4f})")
+        selected += to_add
 
     print(f"[DEBUG] 最終選中的 QA 數量: {len(selected)}")
-    return selected[:10]
-
+    return selected
 
 def generate_final_answer(llm: ChatOpenAI, query: str, selected_qa: list) -> str:
     """根據篩選後的 QA 列表，組合 context 並請 Gemini 回答。"""
     context = "\n\n".join(
-        [f"標題：{q['title']}\n新聞內容：{q['content']}" for q in selected_qa]
+        [f"標題：{q['title']}\n新聞內容：{q['content']}" for q in selected_qa if "content" in q]
     )
     prompt = (
         f"使用者問題：{query}\n"
         f"請根據以下新聞內容，彙整出有條理的答案：\n\n{context}"
     )
-    result = llm.invoke(prompt)
-    return str(getattr(result, "content", result))
+    try:
+        result = llm.invoke(prompt)
+
+        print("[DEBUG] LLM invoke 回傳型別：", type(result))
+        print("[DEBUG] LLM invoke 回傳內容：", result)
+
+        if isinstance(result, str):
+            return result.strip()
+
+        if hasattr(result, "content"):
+            content = result.content
+        else:
+            content = result
+
+        if isinstance(content, list):
+            string_items = [c for c in content if isinstance(c, str)]
+            dict_items = [c["text"] for c in content if isinstance(c, dict) and "text" in c]
+            merged = string_items + dict_items
+            if merged:
+                return "\n".join(merged).strip()
+            return str(content)
+
+        return str(content).strip()
+
+    except Exception as e:
+        print(f"[ERROR] LLM 回答失敗：{e}")
+        return "⚠️ 無法產生答案，請稍後再試。"
+
 
