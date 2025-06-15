@@ -8,7 +8,7 @@ import joblib
 from datetime import datetime
 from pydantic import SecretStr
 from dotenv import load_dotenv
-load_dotenv() # 自 .env 載入 GOOGLE_API_KEY，供 ChatGoogleGenerativeAI 使用
+load_dotenv() # 自 .env 載入 GOOGLE_API_KEY
 from mode3 import query_type_check, get_top_simulated_questions, select_relevant_qa, generate_final_answer
 
 # ============================ Page Config ============================
@@ -95,12 +95,10 @@ def load_resources_per_model(cfg: Dict[str, str]) -> Dict[str, Any]:
         print(f"[ERROR] Failed to load clusterer from {clusterer_path}: {e}")
         clusterer = None
 
-    gemini_api_key = SecretStr(os.getenv("GOOGLE_API_KEY") or "")
-    gemini_api_base = "https://generativelanguage.googleapis.com/v1beta/openai/"
+    openai_api_key = SecretStr(os.getenv("OPENAI_API_KEY") or "")
     base_llm = ChatOpenAI(
-        api_key=gemini_api_key,
-        base_url=gemini_api_base,
-        model="gemini-1.5-flash",
+        api_key=openai_api_key,
+        model="gpt-4o",
         temperature=0.0
     )
     return {
@@ -156,13 +154,11 @@ def get_rag_answer(query: str, model: VectorModel, mode: RetrievalMode, k: int, 
     if query is None or not isinstance(query, str) or not query.strip():
         return "⚠️ 請輸入有效的問題句子。", [], "0.00 秒"
 
-    gemini_api_key = SecretStr(os.getenv("GOOGLE_API_KEY") or "")
-    gemini_api_base = "https://generativelanguage.googleapis.com/v1beta/openai/"
+    openai_api_key = SecretStr(os.getenv("OPENAI_API_KEY") or "")
 
     llm = ChatOpenAI(
-        api_key=gemini_api_key,
-        base_url=gemini_api_base,
-        model="gemini-1.5-flash",
+        api_key=openai_api_key,
+        model="gpt-4o",
         temperature=temp
     )
 
@@ -215,7 +211,7 @@ def get_rag_answer(query: str, model: VectorModel, mode: RetrievalMode, k: int, 
         print(f"[DEBUG][Mode 2] Retrieved {len(docs)} docs from cluster {cid}")
 
         prompt = ChatPromptTemplate.from_messages([
-            ("system", "Use the following context to answer the question. If you don’t know, say so.\n\n{context}"),
+            ("system", "你是一位知識型問答助理，請根據以下新聞內容回答問題。\n若你無法根據這些內容得出答案，請誠實回覆「我無法確定答案」。\n\n{context}"),
             ("human", "{input}")
         ])
         combine_chain = create_stuff_documents_chain(llm=llm, prompt=prompt)
@@ -270,8 +266,10 @@ def get_rag_answer(query: str, model: VectorModel, mode: RetrievalMode, k: int, 
                 {
                     "title": q["title"],
                     "source": q.get("source", ""),
+                    "doc_id": q.get("doc_id", f"Doc {i+1}"),
+                    "cluster_id": q.get("cluster", "N/A")
                 }
-                for q in relevant_qa
+                for i, q in enumerate(relevant_qa)
             ]
             return f"(Model {model.value} | Cluster {cid})\n" + answer, sources, f"{time.time() - start_time:.2f} 秒"
 
@@ -282,9 +280,8 @@ def get_rag_answer(query: str, model: VectorModel, mode: RetrievalMode, k: int, 
     elif mode == RetrievalMode.DIRECT:
         try:
             llm = ChatOpenAI(
-                api_key=gemini_api_key,
-                base_url=gemini_api_base,
-                model="gemini-1.5-flash",
+                api_key=openai_api_key,
+                model="gpt-4o",
                 temperature=temp,
             )
             output = llm.invoke(query)

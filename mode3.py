@@ -36,7 +36,7 @@ def get_top_simulated_questions(
     top_n: int = 20
 ) -> DataFrame:
     """語意找 top-N，再加上關鍵詞強匹配 QA 補充進去"""
-    qa_subset = QA_DF[QA_DF["cluster"] == cluster_id].reset_index(drop=True)
+    qa_subset = QA_DF[QA_DF["cluster"] == cluster_id].reset_index()
     vec_subset = QA_VEC_SIMPLE[qa_subset.index] if question_type == "Q_simple" else QA_VEC_COMPLEX[qa_subset.index]
 
     query_vec = np.array(query_vec, dtype=np.float32).reshape(1, -1)
@@ -61,6 +61,12 @@ def get_top_simulated_questions(
     matched = qa_subset[qa_subset[question_type].apply(is_overlap)]
     print(f"[DEBUG] 額外找到 {len(matched)} 筆含 query 詞的 QA")
 
+    if not matched.empty:
+        matched["similarity"] = matched.index.map(lambda idx: similarities[idx])
+        print("[DEBUG] 額外補強 QA 相似度列表：")
+        for i, row in matched.iterrows():
+            print(f"- {row[question_type]} (similarity: {row['similarity']:.4f})")
+
     # 合併（避免重複）並加入 priority 欄位排序
     merged_df = pd.concat([top_df, matched]).drop_duplicates().reset_index(drop=True)
 
@@ -74,9 +80,6 @@ def get_top_simulated_questions(
 
     # 最後限制最多 top_n（可改為 20 或 30）
     return merged_df.head(top_n)
-
-
-
 
 def judge_relevance_batch(llm: ChatOpenAI, query: str, qa_list: list[str]) -> list[bool]:
     """一次判斷多個 QA 是否與 query 有關，回傳 boolean list"""
@@ -111,18 +114,20 @@ def judge_relevance_batch(llm: ChatOpenAI, query: str, qa_list: list[str]) -> li
 
 
 def select_relevant_qa(llm, query, qa_df: pd.DataFrame, question_col: str, max_rounds: int = 3) -> list[dict]:
-    """使用 Gemini 檢查問題是否與 query 相關，最多進行三輪檢查，最後不足再用 cosine similarity 補滿。"""
+    """使用 OpenAI 檢查問題是否與 query 相關，最多進行三輪檢查，最後不足再用 cosine similarity 補滿。"""
     if len(qa_df) == 0:
         print("[DEBUG] QA 資料為空，無法進行相關性判斷")
         return []
 
     # 準備 QA pool
-    qa_df = qa_df[[question_col, "title", "source", "similarity"]].dropna(subset=[question_col]).drop_duplicates()
+    qa_df = qa_df.dropna(subset=[question_col]).drop_duplicates(subset=[question_col])
     qa_list = qa_df.to_dict(orient="records")
 
     # prompt chain
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "你是一位多領域的問答系統助手，請判斷下列問題是否與使用者問題主題相符。如果你覺得它有助於回答用戶的問題，請回答「是」，否則回答「否」。\n\n用戶問題：{query}\n\n問題：{question}"),
+        ("system", """你是一位多領域的問答系統助手，根據使用者的提問，判斷下列每個模擬問題是否有助於產生答案。
+    只需回覆「是」或「否」。
+         """),
         ("human", "{question}")
     ])
     relevance_chain = LLMChain(llm=llm, prompt=prompt)
@@ -157,7 +162,7 @@ def select_relevant_qa(llm, query, qa_df: pd.DataFrame, question_col: str, max_r
 
         # 避免超過 API 限制
         if i < max_rounds - 1:
-            print("[DEBUG] 等待 10 秒以避免 Gemini API 達到速率上限...")
+            print("[DEBUG] 等待 10 秒以避免 OpenAI API 達到速率上限...")
             sleep(10)
 
         if len(selected) >= 10:
@@ -176,16 +181,27 @@ def select_relevant_qa(llm, query, qa_df: pd.DataFrame, question_col: str, max_r
         selected += to_add
 
     print(f"[DEBUG] 最終選中的 QA 數量: {len(selected)}")
+    # 準備欄位對應
+    cluster_map = qa_df.set_index(question_col)["cluster"].to_dict()
+    index_map = qa_df.set_index(question_col)["index"].to_dict()
+
+    for qa in selected:
+        question = qa[question_col]
+        qa.setdefault("doc_id", index_map.get(question, f"Doc {selected.index(qa)+1}"))
+        qa.setdefault("cluster_id", cluster_map.get(question, "N/A"))
+
     return selected
 
 def generate_final_answer(llm: ChatOpenAI, query: str, selected_qa: list) -> str:
-    """根據篩選後的 QA 列表，組合 context 並請 Gemini 回答。"""
+    """根據篩選後的 QA 列表，組合 context 並請 OpenAI 回答。"""
     context = "\n\n".join(
         [f"標題：{q['title']}\n新聞內容：{q['content']}" for q in selected_qa if "content" in q]
     )
     prompt = (
-        f"使用者問題：{query}\n"
-        f"請根據以下新聞內容，彙整出有條理的答案：\n\n{context}"
+        f"請你根據以下新聞內容，以條列方式完整回答使用者的問題。\n"
+        f"若內容不足以回答，請誠實地說明。\n\n"
+        f"使用者問題：{query}\n\n"
+        f"新聞內容如下：\n{context}"
     )
     try:
         result = llm.invoke(prompt)
@@ -214,5 +230,4 @@ def generate_final_answer(llm: ChatOpenAI, query: str, selected_qa: list) -> str
     except Exception as e:
         print(f"[ERROR] LLM 回答失敗：{e}")
         return "⚠️ 無法產生答案，請稍後再試。"
-
 
