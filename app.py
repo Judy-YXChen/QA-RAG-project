@@ -5,6 +5,7 @@ from typing import List, Dict, Any, Optional, cast
 from enum import Enum
 import requests
 import joblib
+from datetime import datetime
 from pydantic import SecretStr
 from dotenv import load_dotenv
 load_dotenv() # 自 .env 載入 GOOGLE_API_KEY，供 ChatGoogleGenerativeAI 使用
@@ -19,12 +20,13 @@ class RetrievalMode(str, Enum):
     """The three retrieval pipelines a user can choose from."""
     ALL = "All News"                         # 🔍 全庫檢索
     CLUSTER = "Within Cluster"              # 🔍 限縮到同群
-    TEMPLATE = "Cluster + QA Template"      # 🔍 同群 + LangGraph（簡/詳答）
+    TEMPLATE = "Cluster + QA Template"
+    DIRECT = "LLM Only (No Retrieval)"      # 🔍 同群 + LangGraph（簡/詳答）
 
 class VectorModel(str, Enum):
     """Which embedding / clustering space to use."""
-    BGE = "BGE‑base‑zh"            # 中文語料最佳，適合新聞語句
-    BERT = "bert‑base‑chinese"     # 經典中文 BERT
+    BGE = "BGE-base-zh"            # 中文語料最佳，適合新聞語句
+    BERT = "bert-base-chinese"     # 經典中文 BERT
 
 # 對應路徑 & 模型名稱
 MODEL_CONFIG: Dict[VectorModel, Dict[str, str]] = {
@@ -52,14 +54,15 @@ with st.sidebar:
         "Vector Model", list(VectorModel), format_func=lambda m: m.value)
     mode: RetrievalMode = st.selectbox(
         "Retrieval Mode", list(RetrievalMode), format_func=lambda m: m.value)
-    top_k = st.slider("Top‑K Documents", 1, 20, 1)
+    top_k = st.slider("Top-K Documents", 1, 20, 1)
     temperature = st.slider("LLM Temperature", 0.0, 1.0, 0.7)
     st.markdown("---")
-    st.caption("Mode 1 = 全庫 | Mode 2 = 依分群 | Mode 3 = 依分群 + QA")
+    st.caption("Mode 1 = 全庫 | Mode 2 = 依分群 | Mode 3 = 依分群 + QA| Mode 4 = 直接問LLM")
 
 # -------------------------------------------------------------------
 # 2. RESOURCE LOADERS (CACHED) ---------------------------------------
 # -------------------------------------------------------------------
+import time
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_openai import ChatOpenAI
@@ -147,7 +150,11 @@ def _build_retriever(model: VectorModel, k: int, cluster_id: Optional[int] = Non
     return retriever
 
 def get_rag_answer(query: str, model: VectorModel, mode: RetrievalMode, k: int, temp: float):
-    """Route query through the selected pipeline & vector space."""
+    start_time = time.time()  # 開始計時
+
+    if query is None or not isinstance(query, str) or not query.strip():
+        return "⚠️ 請輸入有效的問題句子。", [], "0.00 秒"
+
     gemini_api_key = SecretStr(os.getenv("GOOGLE_API_KEY") or "")
     gemini_api_base = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
@@ -161,55 +168,111 @@ def get_rag_answer(query: str, model: VectorModel, mode: RetrievalMode, k: int, 
     # Mode 1 ── 全庫檢索
     if mode == RetrievalMode.ALL:
         retriever = _build_retriever(model, k)
+        docs = retriever.invoke(query)
+
+        if not docs:
+            return "⚠️ 查無相關資料。", [], f"{time.time() - start_time:.2f} 秒"
+
+        print(f"[DEBUG][Mode 1] Retrieved {len(docs)} documents.")
+
         prompt = ChatPromptTemplate.from_messages([
             ("system", "Use the following context to answer the question. If you don’t know, say so.\n\n{context}"),
             ("human", "{input}")
         ])
         combine_chain = create_stuff_documents_chain(llm=llm, prompt=prompt)
-        chain = create_retrieval_chain(retriever=retriever, combine_docs_chain=combine_chain)
-        result = chain.invoke({"input": query})
-        return result["answer"], result.get("source_documents", [])
+
+        try:
+            answer_body = combine_chain.invoke({"input": query, "context": docs})
+            titles_preview = []
+            for i, d in enumerate(docs):
+                metadata = d.metadata or {}
+                doc_id = metadata.get("doc_id", f"Doc {i+1}")
+                title = metadata.get("title", f"文件 {i+1}")
+                source = metadata.get("source", "#")
+                link = f"<a href='{source}' target='_blank'>{title}</a>" if source and source != "#" else title
+                titles_preview.append(f"{doc_id}. {link}")
+
+            prefix = "📄 <b>參考文章：</b><br>" + "<br>".join(titles_preview) + "<br><br>"
+            answer = prefix + answer_body
+            return answer, docs, f"{time.time() - start_time:.2f} 秒"
+
+        except Exception as e:
+            return f"❌ 全庫檢索失敗：{e}", [], f"{time.time() - start_time:.2f} 秒"
 
     # Mode 2 ── 群內檢索
-    if mode == RetrievalMode.CLUSTER:
+    elif mode == RetrievalMode.CLUSTER:
         cid = _predict_cluster(query, model)
         if cid is None:
-            return "⚠️ 無法辨識此問題屬於哪個主題群，將跳過回答。", []
+            return "⚠️ 無法辨識此問題屬於哪個主題群，將跳過回答。", [], f"{time.time() - start_time:.2f} 秒"
+
         retriever = _build_retriever(model, k, cluster_id=cid)
         docs = retriever.invoke(query)
+
         if not docs:
-            return f"⚠️ 雖然預測為第 {cid} 群，但查無相關資料。", []
-        print(f"[DEBUG] Retrieved {len(docs)} docs from cluster {cid}")
+            return f"⚠️ 雖然預測為第 {cid} 群，但查無相關資料。", [], f"{time.time() - start_time:.2f} 秒"
+
+        print(f"[DEBUG][Mode 2] Retrieved {len(docs)} docs from cluster {cid}")
+
         prompt = ChatPromptTemplate.from_messages([
             ("system", "Use the following context to answer the question. If you don’t know, say so.\n\n{context}"),
             ("human", "{input}")
         ])
         combine_chain = create_stuff_documents_chain(llm=llm, prompt=prompt)
-        chain = create_retrieval_chain(retriever=retriever, combine_docs_chain=combine_chain)
+
         try:
-            result = chain.invoke({"input": query})
-            answer = f"(Model {model.value} | Cluster {cid})\n" + result["answer"]
-            return answer, result.get("source_documents", [])
+            answer_body = combine_chain.invoke({"input": query, "context": docs})
+            titles_preview = []
+            for i, d in enumerate(docs):
+                metadata = d.metadata or {}
+                doc_id = metadata.get("doc_id", f"Doc {i+1}")
+                title = metadata.get("title", f"文件 {i+1}")
+                source = metadata.get("source", "#")
+                link = f"<a href='{source}' target='_blank'>{title}</a>" if source and source != "#" else title
+                titles_preview.append(f"{doc_id}. {link}")
+
+            prefix = "📄 <b>參考文章：</b><br>" + "<br>".join(titles_preview) + "<br><br>"
+            answer = prefix + answer_body
+            return answer, docs, f"{time.time() - start_time:.2f} 秒"
+
         except Exception as e:
-            return f"❌ 分群問答流程失敗：{e}", []
+            return f"❌ 分群問答流程失敗：{e}", [], f"{time.time() - start_time:.2f} 秒"
 
     # Mode 3 ── LangGraph 模板（外部 API 呼叫）
-    cid = _predict_cluster(query, model)
-    payload = {
-        "query": query,
-        "cluster_id": cid,
-        "vector_model": model.value,
-        "top_k": k,
-        "temperature": temp,
-        "answer_style": "auto",
-    }
-    try:
-        rsp = requests.post(LG_ENDPOINT, json=payload, timeout=90)
-        rsp.raise_for_status()
-        data = rsp.json()
-        return data.get("answer", "⚠️ 尚未產生回答。"), data.get("sources", [])
-    except Exception as e:
-        return f"❌ LangGraph 呼叫失敗：{e}", []
+    elif mode == RetrievalMode.TEMPLATE:
+        cid = _predict_cluster(query, model)
+        payload = {
+            "query": query,
+            "cluster_id": cid,
+            "vector_model": model.value,
+            "top_k": k,
+            "temperature": temp,
+            "answer_style": "auto",
+        }
+        try:
+            rsp = requests.post(LG_ENDPOINT, json=payload, timeout=90)
+            rsp.raise_for_status()
+            data = rsp.json()
+            return data.get("answer", "⚠️ 尚未產生回答。"), data.get("sources", []), f"{time.time() - start_time:.2f} 秒"
+        except Exception as e:
+            return f"❌ LangGraph 呼叫失敗：{e}", [], f"{time.time() - start_time:.2f} 秒"
+
+    # Mode 4 ── 直接問 LLM（不檢索）
+    elif mode == RetrievalMode.DIRECT:
+        try:
+            llm = ChatOpenAI(
+                api_key=gemini_api_key,
+                base_url=gemini_api_base,
+                model="gemini-1.5-flash",
+                temperature=temp,
+            )
+            output = llm.invoke(query)
+            answer = output if isinstance(output, str) else output.content
+            return answer, [], f"{time.time() - start_time:.2f} 秒"
+        except Exception as e:
+            return f"❌ 直接問答失敗：{e}", [], f"{time.time() - start_time:.2f} 秒"
+
+    # 預防萬一
+    return "⚠️ 無法辨識的模式。", [], f"{time.time() - start_time:.2f} 秒"
 
 # -------------------------------------------------------------------
 # 4. SESSION STATE (CHAT) --------------------------------------------
@@ -220,6 +283,9 @@ if "messages" not in st.session_state:
 for msg in st.session_state["messages"]:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"], unsafe_allow_html=True)
+        if msg.get("source"):  # 有資料來源才顯示
+            with st.expander("🔗 Sources"):
+                st.markdown(msg["source"], unsafe_allow_html=True)
 
 # -------------------------------------------------------------------
 # 5. CHAT INPUT LOOP --------------------------------------------------
@@ -235,17 +301,49 @@ if user_query:
     # 5.2 ── Generate answer
     with st.chat_message("assistant"):
         with st.spinner("🔎 Retrieving & Generating…"):
-            answer, docs = get_rag_answer(user_query, vec_model, mode, top_k, temperature)
-            st.markdown(answer)
-            if docs:
-                with st.expander("🔗 Sources"):
-                    for i, d in enumerate(docs, 1):
-                        title = d.metadata.get("title", f"Doc {i}")
-                        source = d.metadata.get("source", "")
-                        st.markdown(f"{i}. **{title}** — {source}")
+            answer, docs, duration_str = get_rag_answer(user_query, vec_model, mode, top_k, temperature)
 
-    # -- 5.3 Save assistant turn
-    st.session_state["messages"].append({"role": "assistant", "content": answer})
+    # 將回答拆成「正文」與「來源清單」
+    if "<br><br>" in answer:
+        answer_lines = answer.split("<br><br>", 1)
+        source_html = answer_lines[0]
+        answer_body_html = answer_lines[1]
+    else:
+        source_html = ""
+        answer_body_html = answer  # 直接回答，不含來源說明
+
+    # 顯示回答本體
+    st.markdown(answer_body_html, unsafe_allow_html=True)
+    # 顯示時間戳記
+    if duration_str:
+        st.caption(f"⏱️ 回答生成時間：{duration_str}")
+
+    # 顯示參考來源（可展開），若有 docs
+    if docs:
+        with st.expander("🔗 Sources"):
+            for i, d in enumerate(docs):
+                metadata = d.metadata or {}
+                doc_id = metadata.get("doc_id", f"Doc {i+1}")
+                title = metadata.get("title", f"文件 {i+1}")
+                source = metadata.get("source", "#")
+                cluster_id = metadata.get("cluster_id", "N/A")
+
+                if source and source != "#":
+                    link = f"<a href='{source}' target='_blank'>{title}</a>"
+                else:
+                    link = title
+
+                st.markdown(f"{i+1}. {link}<br>📄 Cluster: {cluster_id} | Article ID: {doc_id}<br>", unsafe_allow_html=True)
+
+# -- 5.3 Save assistant turn（✨完整儲存來源）
+if user_query and "answer_body_html" in locals():
+    st.session_state["messages"].append({
+    "role": "assistant",
+    "content": answer_body_html,
+    "source": source_html
+})
+
+
 
 # -------------------------------------------------------------------
 # 6. FOOTER -----------------------------------------------------------
